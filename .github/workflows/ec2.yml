@@ -1,13 +1,14 @@
 name: EC2 Deploy (short)
 
 on:
-  push:
-    branches: [main]
-  workflow_dispatch: {}
+  repository_dispatch:
+    types: [deploy-ec2]  # ECR에서 보낸 이벤트만 받음
+  workflow_dispatch: {}   # 수동 실행은 유지
 
 env:
   AWS_REGION: ap-northeast-2
-  IMAGE: 077672914621.dkr.ecr.ap-northeast-2.amazonaws.com/kickytime-repo:latest
+  # ECR에서 전달받은 이미지 URI 사용, 없으면 latest
+  IMAGE: ${{ github.event.client_payload.image_uri || '077672914621.dkr.ecr.ap-northeast-2.amazonaws.com/kickytime-repo:latest' }}
   TARGET_TAG_KEY: Role
   TARGET_TAG_VALUE: app
   PORT: "8080"
@@ -25,6 +26,8 @@ jobs:
 
       - name: Run on all tagged instances via SSM
         run: |
+          echo "Deploying image: $IMAGE"
+          
           aws ssm send-command \
             --region $AWS_REGION \
             --document-name "AWS-RunShellScript" \
@@ -34,12 +37,12 @@ jobs:
               "commands": [
                 "set -e",
                 "command -v docker >/dev/null 2>&1 || (dnf -y install docker && systemctl enable --now docker)",
-                "REG=$(echo '"$IMAGE"' | cut -d/ -f1)",
-                "aws ecr get-login-password --region '"$AWS_REGION"' | docker login --username AWS --password-stdin $REG",
+                "REG=$(echo \"'$IMAGE'\" | cut -d/ -f1)",
+                "aws ecr get-login-password --region '$AWS_REGION' | docker login --username AWS --password-stdin $REG",
                 "docker rm -f kickytime || true",
-                "docker pull '"$IMAGE"'",
-                "docker run -d --name kickytime -p '"$PORT"':'"$PORT"' '"$IMAGE"'",
-                "for i in $(seq 1 60); do curl -fsS http://127.0.0.1:'"$PORT$HEALTH"' && break || sleep 2; done"
+                "docker pull \"'$IMAGE'\"",
+                "docker run -d --name kickytime -p '$PORT':'$PORT' \"'$IMAGE'\"",
+                "for i in $(seq 1 60); do curl -fsS http://127.0.0.1:'$PORT$HEALTH' && break || sleep 2; done"
               ],
               "executionTimeout": ["1800"]
             }' \
