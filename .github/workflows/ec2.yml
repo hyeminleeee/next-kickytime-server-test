@@ -23,14 +23,36 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Run on all tagged instances via SSM
+      # ✅ 추가된 최소 스텝: 실행중 + 태그(Role=app) + SSM Online 교집합 → ids_list 출력
+      - name: Resolve running + tagged + SSM-online
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUNNING_IDS=$(aws ec2 describe-instances \
+            --region "${AWS_REGION}" \
+            --filters "Name=tag:${TARGET_TAG_KEY},Values=${TARGET_TAG_VALUE}" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' --output text | tr '\t' '\n' || true)
+          SSM_ONLINE_IDS=$(aws ssm describe-instance-information \
+            --region "${AWS_REGION}" \
+            --filters "Key=PingStatus,Values=Online" \
+            --query 'InstanceInformationList[].InstanceId' --output text | tr '\t' '\n' || true)
+          TARGET_IDS=$(comm -12 <(printf '%s\n' $RUNNING_IDS | sort) <(printf '%s\n' $SSM_ONLINE_IDS | sort) || true)
+          if [ -z "${TARGET_IDS:-}" ]; then
+            echo "No targets (running+tagged+ssm-online)."; exit 1
+          fi
+          echo "ids_list=$(printf '%s ' $TARGET_IDS)" >> "$GITHUB_OUTPUT"
+
+      - name: Run on all tagged instances via SSM (by instance-ids)
+        env:
+          IDS_LIST: ${{ steps.resolve.outputs.ids_list }}
         run: |
           echo "Deploying image: $IMAGE"
           
           aws ssm send-command \
             --region $AWS_REGION \
             --document-name "AWS-RunShellScript" \
-            --targets "Key=tag:${TARGET_TAG_KEY},Values=${TARGET_TAG_VALUE}" \
+            --instance-ids $IDS_LIST \
             --cloud-watch-output-config CloudWatchOutputEnabled=true,CloudWatchLogGroupName=/aws/ssm/kickytime \
             --parameters '{
               "commands": [
