@@ -1,6 +1,8 @@
 name: EC2 Deploy (short)
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch: {}
 
 env:
