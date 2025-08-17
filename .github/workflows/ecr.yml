@@ -71,7 +71,7 @@ jobs:
 
           echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_OUTPUT
 
-      - name: Verify multi-arch manifest
+      - name: Verify multi-arch manifest (Fixed)
         run: |
           set -e
           REGISTRY="${{ steps.ecr.outputs.registry }}"
@@ -82,8 +82,20 @@ jobs:
           echo "Manifests:"
           echo "$ARCHES"
 
-          echo "$ARCHES" | grep -q 'linux/amd64' || (echo "Missing linux/amd64 in manifest" && exit 1)
-          echo "$ARCHES" | grep -q 'linux/arm64' || (echo "Missing linux/arm64 in manifest" && exit 1)
+          # 정확한 매칭으로 수정
+          if ! echo "$ARCHES" | grep -x 'linux/amd64' > /dev/null; then
+            echo "❌ Missing linux/amd64 in manifest"
+            echo "Available platforms: $ARCHES"
+            exit 1
+          fi
+
+          if ! echo "$ARCHES" | grep -x 'linux/arm64' > /dev/null; then
+            echo "❌ Missing linux/arm64 in manifest"
+            echo "Available platforms: $ARCHES"
+            exit 1
+          fi
+
+          echo "✅ Both linux/amd64 and linux/arm64 found"
 
       # repository_dispatch 전송 + HTTP 204 확인
       - name: Trigger ECS/EC2 Deploy via repository_dispatch
