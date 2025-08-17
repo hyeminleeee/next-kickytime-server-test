@@ -2,12 +2,11 @@ name: EC2 Deploy (short)
 
 on:
   repository_dispatch:
-    types: [deploy-ec2]  # ECR에서 보낸 이벤트만 받음
-  workflow_dispatch: {}   # 수동 실행은 유지
+    types: [deploy-ec2]
+  workflow_dispatch: {}
 
 env:
   AWS_REGION: ap-northeast-2
-  # ECR에서 전달받은 이미지 URI 사용, 없으면 latest
   IMAGE: ${{ github.event.client_payload.image_uri || '077672914621.dkr.ecr.ap-northeast-2.amazonaws.com/kickytime-repo:latest' }}
   TARGET_TAG_KEY: Role
   TARGET_TAG_VALUE: app
@@ -41,7 +40,11 @@ jobs:
                 "aws ecr get-login-password --region '$AWS_REGION' | docker login --username AWS --password-stdin $REG",
                 "docker rm -f kickytime || true",
                 "docker pull \"'$IMAGE'\"",
-                "docker run -d --name kickytime -p '$PORT':'$PORT' \"'$IMAGE'\"",
+                "docker run -d --name kickytime -p '$PORT':'$PORT' \\",
+                "  -e SPRING_DATASOURCE_URL=\"'${{ secrets.DB_URL }}'\" \\",
+                "  -e SPRING_DATASOURCE_USERNAME=\"'${{ secrets.DB_USERNAME }}'\" \\",
+                "  -e SPRING_DATASOURCE_PASSWORD=\"'${{ secrets.DB_PASSWORD }}'\" \\",
+                "  \"'$IMAGE'\"",
                 "for i in $(seq 1 60); do curl -fsS http://127.0.0.1:'$PORT$HEALTH' && break || sleep 2; done"
               ],
               "executionTimeout": ["1800"]
