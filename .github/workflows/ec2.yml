@@ -14,39 +14,39 @@ permissions:
 
 env:
   AWS_REGION: ap-northeast-2
-  # ✅ 배포 대상 EC2 리스트(JSON 배열). 필요에 맞게 교체하세요.
-  INSTANCE_IDS_JSON: '["i-08f17d18d83292c07","i-08316767f2bd4a5ed"]'
+  ASG_NAME: kickytime-asg
 
-  # ✅ 앱/컨테이너 설정
-  APP_NAME: kickytime            # 기존 컨테이너 기본 이름 (예: kickytime)
-  CONTAINER_PORT: "8080"         # 컨테이너 내부 포트
-  HOST_PORT_BASE: "8080"         # 기존 컨테이너가 바인드하는 호스트 포트
-  HEALTH_PATH: "/actuator/health" # 헬스체크 경로
-  HEALTH_TIMEOUT_SEC: "180"      # 헬스체크 최대 대기시간
-  ENV_FILE_PATH: ""              # 예: /opt/kickytime/.env (없으면 빈 값)
+  # 앱/컨테이너 설정
+  APP_NAME: kickytime
+  CONTAINER_PORT: "8080"
+  HOST_PORT_BASE: "8080"
+  HEALTH_PATH: "/actuator/health"
+  HEALTH_TIMEOUT_SEC: "600"
+  ENV_FILE_PATH: ""
+
+  # SSM 설정
+  SSM_WAIT_SEC: "3600"
+  SSM_MAX_CONCURRENCY: "50"
+  SSM_MAX_ERRORS: "1"
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 1
-      matrix:
-        instance_id: ${{ fromJson(env.INSTANCE_IDS_JSON) }}
 
     env:
       PAYLOAD_IMAGE_URI: ${{ github.event.client_payload.image_uri }}
-      PAYLOAD_TAG:       ${{ github.event.client_payload.tag }}
-      PAYLOAD_BRANCH:    ${{ github.event.client_payload.branch }}
-      PAYLOAD_SHA:       ${{ github.event.client_payload.sha }}
+      PAYLOAD_TAG: ${{ github.event.client_payload.tag }}
+      PAYLOAD_BRANCH: ${{ github.event.client_payload.branch }}
+      PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
 
     steps:
       - name: Gate - only deploy for main
         id: gate
         run: |
           if [ "${PAYLOAD_BRANCH}" = "main" ]; then
-            echo "GO=true" >> $GITHUB_OUTPUT
+            echo "GO=true" >> "$GITHUB_OUTPUT"
           else
-            echo "GO=false" >> $GITHUB_OUTPUT
+            echo "GO=false" >> "$GITHUB_OUTPUT"
             echo "Non-deploy branch: ${PAYLOAD_BRANCH}"
           fi
 
@@ -60,121 +60,253 @@ jobs:
         if: steps.gate.outputs.GO == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ env.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Send rolling deploy command via SSM
+      - name: Ensure tools (jq)
         if: steps.gate.outputs.GO == 'true'
-        id: ssm
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Ensure CloudWatch Logs group for SSM
+        if: steps.gate.outputs.GO == 'true'
+        run: |
+          set -e
+          LOG_GROUP="/aws/ssm/kickytime"
+          aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" --region ${{ env.AWS_REGION }} | \
+            jq -e '.logGroups[]? | select(.logGroupName=="'"$LOG_GROUP"'")' >/dev/null 2>&1 || \
+            aws logs create-log-group --log-group-name "$LOG_GROUP" --region ${{ env.AWS_REGION }}
+          aws logs put-retention-policy --log-group-name "$LOG_GROUP" --retention-in-days 7 --region ${{ env.AWS_REGION }} || true
+
+      - name: Resolve live ASG targets (InService + running + SSM Online)
+        if: steps.gate.outputs.GO == 'true'
+        id: resolve
         run: |
           set -e
 
-          TARGET_ID="${{ matrix.instance_id }}"
-          echo "Deploying to instance: $TARGET_ID"
-          
-          # 새 컨테이너가 바인드할 임시 포트(현재 HOST_PORT_BASE+1)
-          NEXT_PORT=$(( ${HOST_PORT_BASE} + 1 ))
+          # 1) ASG InService 인스턴스
+          ASG_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --region "${AWS_REGION}" \
+            --auto-scaling-group-names "${ASG_NAME}" \
+            --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
+            --output text | tr '\t' '\n' || true)
 
-          # SSM에 보낼 스크립트를 JSON 안전하게 변환
-          read -r -d '' SCRIPT <<'EOSCRIPT'
+          if [ -z "$ASG_IDS" ]; then
+            echo "No InService instances in ASG: ${ASG_NAME}"
+            exit 1
+          fi
+          echo "ASG InService:"
+          echo "$ASG_IDS"
+
+          # 2) EC2 상태 = running
+          RUNNING=$(aws ec2 describe-instances \
+            --region "${AWS_REGION}" \
+            --instance-ids $ASG_IDS \
+            --query 'Reservations[].Instances[?State.Name==`running`].InstanceId' \
+            --output text | tr '\t' '\n' || true)
+          if [ -z "$RUNNING" ]; then
+            echo "No running instances."
+            exit 1
+          fi
+          echo "EC2 running:"
+          echo "$RUNNING"
+
+          # 3) SSM Online
+          ONLINE=$(aws ssm describe-instance-information \
+            --region "${AWS_REGION}" \
+            --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
+            --output text | tr '\t' '\n' || true)
+
+          TARGET_IDS=$(comm -12 <(echo "$RUNNING" | sort) <(echo "$ONLINE" | sort) || true)
+          if [ -z "$TARGET_IDS" ]; then
+            echo "No SSM-online instances among running ASG members."
+            exit 1
+          fi
+          echo "Final targets:"
+          echo "$TARGET_IDS"
+
+          printf "IDS_JSON=%s\n" "$(echo "$TARGET_IDS" | jq -Rsc 'split("\n")|map(select(length>0))')" >> "$GITHUB_OUTPUT"
+
+      - name: Send rolling deploy via SSM (instance-ids)
+        if: steps.gate.outputs.GO == 'true'
+        id: ssm
+        run: |
+          set -Eeuo pipefail
+
+          IDS_JSON='${{ steps.resolve.outputs.IDS_JSON }}'
+          IDS_LIST=$(echo "$IDS_JSON" | jq -r '.[]' | xargs)
+          echo "Deploying to:"
+          echo "$IDS_LIST"
+
+          # ── 1) 원격에서 실행할 배포 스크립트를 YAML 내부에 포함(heredoc) → base64로 변환
+          cat > /tmp/kickytime_deploy.sh <<'EOS'
           #!/usr/bin/env bash
-          set -euo pipefail
+          set -Eeuo pipefail
+          set -x
 
-          APP_NAME="${APP_NAME}"
-          IMAGE_URI="${PAYLOAD_IMAGE_URI}"
-          CONTAINER_PORT="${CONTAINER_PORT}"
-          HOST_PORT_BASE="${HOST_PORT_BASE}"
-          NEXT_PORT=$(( HOST_PORT_BASE + 1 ))
-          HEALTH_PATH="${HEALTH_PATH}"
-          HEALTH_TIMEOUT="${HEALTH_TIMEOUT_SEC}"
-          ENV_FILE_PATH="${ENV_FILE_PATH}"
+          echo "[0/9] Env dump"
+          uname -a || true
+          aws --version || true
+          docker --version || true
+
+          # 이 스크립트는 SSM commands의 첫 줄에서 export 된 환경변수를 사용합니다.
+          # 필수: APP_NAME, IMAGE_URI, CONTAINER_PORT, HOST_PORT_BASE, HEALTH_PATH, HEALTH_TIMEOUT, ENV_FILE_PATH, AWS_DEFAULT_REGION
+
+          # 호스트 아키텍처 감지 → 멀티아치 이미지에서 자동 선택
+          HOST_ARCH_RAW="$(uname -m || echo x86_64)"
+          case "$HOST_ARCH_RAW" in
+            x86_64|amd64) HOST_ARCH="amd64" ;;
+            aarch64|arm64) HOST_ARCH="arm64" ;;
+            *) HOST_ARCH="amd64" ;;
+          esac
+          DOCKER_PLATFORM="linux/${HOST_ARCH}"
+          echo "Host arch: ${HOST_ARCH} -> platform: ${DOCKER_PLATFORM}"
+
+          # 공간 점검/청소
+          df -h || true
+          docker system df || true
+          LOW_DISK=$(df -Pm / | awk 'NR==2 { if ($4 < 2048) print "YES"; else print "NO"}')
+          [ "$LOW_DISK" = "YES" ] && docker system prune -af || true
 
           OLD_NAME="${APP_NAME}"
           NEW_NAME="${APP_NAME}_new"
+          NEXT_PORT=$(( HOST_PORT_BASE + 1 ))
 
-          echo "[1/7] ECR 로그인"
+          echo "[1/9] ECR 로그인"
           REGISTRY_HOST="$(echo "$IMAGE_URI" | awk -F'/' '{print $1}')"
-          aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${REGISTRY_HOST}"
+          aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | docker login --username AWS --password-stdin "${REGISTRY_HOST}"
 
-          echo "[2/7] 새 이미지 Pull: ${IMAGE_URI}"
-          docker pull "${IMAGE_URI}"
-
-          echo "[3/7] 이전 NEW 컨테이너 정리(있으면)"
-          if docker ps -a --format '{{.Names}}' | grep -q "^${NEW_NAME}$"; then
-            docker rm -f "${NEW_NAME}" || true
+          echo "[2/9] 이미지 Pull 리트라이(플랫폼 ${DOCKER_PLATFORM})"
+          pull_with_retry () {
+            local platform="$1" ref="$2" tries=3 n=1
+            while [ $n -le $tries ]; do
+              echo "docker pull (try $n/$tries) --platform $platform $ref"
+              if timeout 2400 docker pull --platform "$platform" "$ref"; then return 0; fi
+              sleep $((n*10)); n=$((n+1))
+            done
+            return 1
+          }
+          if ! pull_with_retry "${DOCKER_PLATFORM}" "${IMAGE_URI}"; then
+            echo "기본 플랫폼 풀 실패 → arm64 에뮬 시도"
+            docker run --privileged --rm tonistiigi/binfmt --install arm64 || docker run --privileged --rm tonistiigi/binfmt --install all || true
+            DOCKER_PLATFORM="linux/arm64"
+            pull_with_retry "${DOCKER_PLATFORM}" "${IMAGE_URI}" || { echo "pull failed"; exit 1; }
           fi
 
-          echo "[4/7] 새 컨테이너 기동: ${NEW_NAME} (host ${NEXT_PORT} -> container ${CONTAINER_PORT})"
+          echo "[3/9] 이전 NEW 컨테이너 정리"
+          docker rm -f "${NEW_NAME}" 2>/dev/null || true
+
+          echo "[4/9] 새 컨테이너 기동 (host ${NEXT_PORT} -> container ${CONTAINER_PORT})"
           RUN_ENV_OPTS=()
-          if [ -n "${ENV_FILE_PATH}" ]; then
-            RUN_ENV_OPTS+=( --env-file "${ENV_FILE_PATH}" )
-          fi
+          [ -n "${ENV_FILE_PATH}" ] && RUN_ENV_OPTS+=( --env-file "${ENV_FILE_PATH}" )
+          docker run -d --platform "${DOCKER_PLATFORM}" --name "${NEW_NAME}" -p "${NEXT_PORT}:${CONTAINER_PORT}" "${RUN_ENV_OPTS[@]}" "${IMAGE_URI}"
 
-          docker run -d \
-            --name "${NEW_NAME}" \
-            -p "${NEXT_PORT}:${CONTAINER_PORT}" \
-            "${RUN_ENV_OPTS[@]}" \
-            "${IMAGE_URI}"
-
-          echo "[5/7] 헬스체크: http://127.0.0.1:${NEXT_PORT}${HEALTH_PATH} (timeout: ${HEALTH_TIMEOUT}s)"
+          echo "[5/9] 헬스체크 (NEXT_PORT)"
           SECS=0
           until curl -fsS "http://127.0.0.1:${NEXT_PORT}${HEALTH_PATH}" >/dev/null 2>&1; do
             sleep 3
-            SECS=$(( SECS + 3 ))
-            if [ "${SECS}" -ge "${HEALTH_TIMEOUT}" ]; then
-              echo "❌ 새 컨테이너 헬스체크 실패. 로그:"
-              docker logs --tail 200 "${NEW_NAME}" || true
-              exit 1
-            fi
+            SECS=$((SECS+3))
+            [ "${SECS}" -ge "${HEALTH_TIMEOUT}" ] && { docker logs --tail 200 "${NEW_NAME}" || true; exit 1; }
           done
-          echo "✅ 새 컨테이너 Healthy"
+          echo "✅ Healthy on NEXT_PORT"
 
-          echo "[6/7] 기존 컨테이너 ${OLD_NAME} 종료/삭제 및 포트 스위칭"
-          if docker ps -a --format '{{.Names}}' | grep -q "^${OLD_NAME}$"; then
-            docker rm -f "${OLD_NAME}" || true
-          fi
+          echo "[6/9] 기존 컨테이너 종료/삭제 및 최종 포트(${HOST_PORT_BASE})로 재기동"
+          docker rm -f "${OLD_NAME}" 2>/dev/null || true
+          docker run -d --platform "${DOCKER_PLATFORM}" --name "${OLD_NAME}" -p "${HOST_PORT_BASE}:${CONTAINER_PORT}" "${RUN_ENV_OPTS[@]}" "${IMAGE_URI}"
 
-          # 새 컨테이너를 기본 이름으로 승격
-          docker rename "${NEW_NAME}" "${OLD_NAME}"
+          echo "[7/9] 최종 포트 헬스체크 (최대 60초)"
+          SECS2=0
+          until curl -fsS "http://127.0.0.1:${HOST_PORT_BASE}${HEALTH_PATH}" >/dev/null 2>&1; do
+            sleep 2
+            SECS2=$((SECS2+2))
+            [ "${SECS2}" -ge 60 ] && { docker logs --tail 200 "${OLD_NAME}" || true; exit 1; }
+          done
+          echo "✅ Healthy on ${HOST_PORT_BASE}"
 
-          echo "[7/7] 청소 (Dangling Images/Containers)"
+          echo "[8/9] 임시 NEW 컨테이너 정리 및 청소"
+          docker rm -f "${NEW_NAME}" 2>/dev/null || true
           docker system prune -f || true
 
-          echo "🎉 롤링 완료: $(docker ps --filter "name=${OLD_NAME}" --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}')"
-          EOSCRIPT
+          echo "[9/9] 상태"
+          docker ps --filter "name=${OLD_NAME}" --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}'
+          EOS
 
-          # jq로 이스케이프하여 commands에 넣기
-          JSON_SCRIPT=$(jq -Rn --arg s "$SCRIPT" '$s')
+          BASE64_BODY=$(base64 -w 0 /tmp/kickytime_deploy.sh 2>/dev/null || base64 /tmp/kickytime_deploy.sh | tr -d '\n')
+
+          # ── 2) 원격 환경 변수 주입 + 스크립트 복사/실행
+          CMD1="export APP_NAME='${{ env.APP_NAME }}' IMAGE_URI='${{ env.PAYLOAD_IMAGE_URI }}' CONTAINER_PORT='${{ env.CONTAINER_PORT }}' HOST_PORT_BASE='${{ env.HOST_PORT_BASE }}' HEALTH_PATH='${{ env.HEALTH_PATH }}' HEALTH_TIMEOUT='${{ env.HEALTH_TIMEOUT_SEC }}' ENV_FILE_PATH='${{ env.ENV_FILE_PATH }}' AWS_DEFAULT_REGION='${{ env.AWS_REGION }}'"
+          CMD2="echo '$BASE64_BODY' | base64 -d > /tmp/kickytime_deploy.sh"
+          CMD3="chmod +x /tmp/kickytime_deploy.sh"
+          CMD4="/tmp/kickytime_deploy.sh"
+
+          COMMENT="Deploy ${{ env.APP_NAME }}:${{ env.PAYLOAD_TAG }}"
+          PARAMS_JSON=$(jq -n --arg c1 "$CMD1" --arg c2 "$CMD2" --arg c3 "$CMD3" --arg c4 "$CMD4" --arg t "${SSM_WAIT_SEC}" \
+            '{commands: [$c1,$c2,$c3,$c4], executionTimeout: [$t]}')
 
           CMD_ID=$(aws ssm send-command \
+            --region ${{ env.AWS_REGION }} \
             --document-name "AWS-RunShellScript" \
-            --instance-ids "$TARGET_ID" \
-            --parameters commands="[$JSON_SCRIPT]" \
-            --comment "Rolling deploy ${APP_NAME} -> ${PAYLOAD_IMAGE_URI}" \
-            --timeout-seconds 1800 \
+            --instance-ids $IDS_LIST \
+            --parameters "$PARAMS_JSON" \
+            --comment "$COMMENT" \
+            --max-concurrency "${{ env.SSM_MAX_CONCURRENCY }}" \
+            --max-errors "${{ env.SSM_MAX_ERRORS }}" \
+            --timeout-seconds ${{ env.SSM_WAIT_SEC }} \
+            --cloud-watch-output-config CloudWatchLogGroupName=/aws/ssm/kickytime,CloudWatchOutputEnabled=true \
+            --cli-binary-format raw-in-base64-out \
             --query "Command.CommandId" \
             --output text)
 
           echo "SSM CommandId: ${CMD_ID}"
-          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$TARGET_ID"
-          
-          # 실패 시 로그 출력
-          STATUS=$(aws ssm list-command-invocations --command-id "$CMD_ID" --instance-id "$TARGET_ID" --details \
-                   --query "CommandInvocations[0].Status" --output text)
-          echo "SSM Status: $STATUS"
-          if [ "$STATUS" != "Success" ]; then
-            echo "---- SSM Output ----"
-            aws ssm list-command-invocations --command-id "$CMD_ID" --instance-id "$TARGET_ID" --details \
-              --query "CommandInvocations[0].CommandPlugins[0].{StdOut:Output,StdErr:StandardErrorContent}" --output json
-            exit 1
-          fi
+
+          # ── 3) 전체 대상 상태 폴링(끝까지 기다린 뒤 최종 판단)
+          START_TS=$(date +%s)
+          while true; do
+            INVJSON=$(aws ssm list-command-invocations \
+              --region ${{ env.AWS_REGION }} \
+              --command-id "$CMD_ID" \
+              --details \
+              --max-results 50 \
+              --output json || true)
+
+            TOTAL=$(echo "$INVJSON" | jq '.CommandInvocations | length')
+            SUC=$(echo "$INVJSON" | jq '[.CommandInvocations[]?.Status == "Success"] | map(select(.==true)) | length')
+            INP=$(echo "$INVJSON" | jq '[.CommandInvocations[]?.Status == "InProgress"] | map(select(.==true)) | length')
+            PND=$(echo "$INVJSON" | jq '[.CommandInvocations[]?.Status == "Pending"] | map(select(.==true)) | length')
+            FLD=$(echo "$INVJSON" | jq '[.CommandInvocations[]?.Status == "Failed"] | map(select(.==true)) | length')
+            CXL=$(echo "$INVJSON" | jq '[.CommandInvocations[]?.Status == "Cancelled"] | map(select(.==true)) | length')
+            TMO=$(echo "$INVJSON" | jq '[.CommandInvocations[]?.Status == "TimedOut"] | map(select(.==true)) | length')
+            echo "Summary: total=$TOTAL success=$SUC inprogress=$INP pending=$PND failed=$FLD cancelled=$CXL timedout=$TMO"
+
+            DONE=$((SUC+FLD+CXL+TMO))
+            if [ "$TOTAL" -gt 0 ] && [ "$TOTAL" -eq "$DONE" ]; then
+              if [ "$FLD" -gt 0 ] || [ "$CXL" -gt 0 ] || [ "$TMO" -gt 0 ]; then
+                echo "❌ Completed with failures. Check CloudWatch logs."
+                exit 1
+              else
+                echo "✅ All targets succeeded"
+                break
+              fi
+            fi
+
+            NOW=$(date +%s)
+            ELAPSED=$((NOW-START_TS))
+            if [ "$ELAPSED" -ge "${SSM_WAIT_SEC:-3600}" ]; then
+              echo "⏰ Timeout waiting for fleet to finish."
+              exit 1
+            fi
+
+            sleep 10
+          done
 
       - name: Summary
         if: steps.gate.outputs.GO == 'true'
         run: |
-          echo "### ✅ EC2 Rolling Deploy Completed" >> $GITHUB_STEP_SUMMARY
-          echo "- Instance: \`${{ matrix.instance_id }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Image:    \`${PAYLOAD_IMAGE_URI}\`"     >> $GITHUB_STEP_SUMMARY
-          echo "- Branch:   \`${PAYLOAD_BRANCH}\`"        >> $GITHUB_STEP_SUMMARY
-          echo "- Commit:   \`${PAYLOAD_SHA}\`"           >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ EC2 Rolling Deploy Completed (Dynamic targets)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- TG ARN:   \`${{ env.TARGET_GROUP_ARN || 'n/a' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ASG:      \`${{ env.ASG_NAME }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image:    \`${{ env.PAYLOAD_IMAGE_URI }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Branch:   \`${{ env.PAYLOAD_BRANCH }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit:   \`${{ env.PAYLOAD_SHA }}\`" >> "$GITHUB_STEP_SUMMARY"
